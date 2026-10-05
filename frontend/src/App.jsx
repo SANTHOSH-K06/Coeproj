@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { 
   Activity, Calendar, Database, TrendingUp, AlertTriangle, ShieldCheck, 
-  Settings, Users, Server, Play, RefreshCw, CheckCircle, XCircle, 
+  Settings, Users, Server, Play, RefreshCw, CheckCircle, XCircle, History, Trash2,
   Lock, ArrowRight, Info, Eye, Zap, FileText, ChevronRight
 } from 'lucide-react';
 
@@ -31,6 +31,9 @@ export default function App() {
   const [patients, setPatients] = useState([]);
   const [auditLogs, setAuditLogs] = useState([]);
   const [experimentResults, setExperimentResults] = useState(null);
+  const [storageSnapshots, setStorageSnapshots] = useState([]);
+  const [advancedForecast, setAdvancedForecast] = useState(null);
+  const [purgePreview, setPurgePreview] = useState(null);
 
   // UI Interactive States
   const [loadingAction, setLoadingAction] = useState(false);
@@ -116,6 +119,46 @@ export default function App() {
       }
     } catch (err) {
       console.error('Failed to load system data', err);
+    }
+  };
+
+  const refreshReview2Data = async () => {
+    const [snapshots, forecast, preview] = await Promise.all([
+      apiFetch('/api/metrics/snapshots?limit=100').catch(() => []),
+      apiFetch('/api/forecast/advanced?horizon_days=365').catch(() => null),
+      currentUser?.role === 'admin'
+        ? apiFetch('/api/retention/purge?dry_run=true', { method: 'POST' }).catch(() => null)
+        : Promise.resolve(null)
+    ]);
+    setStorageSnapshots(snapshots);
+    setAdvancedForecast(forecast);
+    setPurgePreview(preview);
+  };
+
+  const handleCaptureSnapshot = async () => {
+    setLoadingAction(true);
+    try {
+      const result = await apiFetch('/api/metrics/snapshots', { method: 'POST' });
+      showToast(`Storage snapshot saved (${result.snapshots_created} records).`, 'success');
+      await refreshReview2Data();
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setLoadingAction(false);
+    }
+  };
+
+  const handleRetentionPurge = async () => {
+    if (!window.confirm('Permanently delete appointments and slots outside each tenant retention window?')) return;
+    setLoadingAction(true);
+    try {
+      const result = await apiFetch('/api/retention/purge?dry_run=false', { method: 'POST' });
+      showToast(`Retention purge removed ${result.deleted_appointments} appointments and ${result.deleted_slots} slots.`, 'success');
+      await Promise.all([fetchAllData(), refreshReview2Data()]);
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      setLoadingAction(false);
     }
   };
 
@@ -363,7 +406,7 @@ export default function App() {
           <div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
               <h1 style={{ fontSize: '1.25rem', color: '#f8fafc' }}>Hospital Capacity Forecasting</h1>
-              <span className="badge badge-cyan">Review 1 — 35% Milestone</span>
+                  <span className="badge badge-cyan">Review 2 — 70% Milestone</span>
             </div>
             <p style={{ fontSize: '0.78rem', color: '#94a3b8' }}>Multi-Tenant Appointment Workflow & Storage Capacity Engine</p>
           </div>
@@ -510,6 +553,14 @@ export default function App() {
                 style={{ justifyContent: 'flex-start', width: '100%', marginBottom: '2px' }}
               >
                 <ShieldCheck size={16} /> Audit & Security
+              </button>
+
+              <button
+                onClick={() => { setActiveTab('review2'); refreshReview2Data(); }}
+                className={`btn ${activeTab === 'review2' ? 'btn-primary' : 'btn-secondary'}`}
+                style={{ justifyContent: 'flex-start', width: '100%', marginBottom: '2px' }}
+              >
+                <History size={16} /> Review 2 Operations
               </button>
             </>
           ) : (
@@ -1354,6 +1405,124 @@ export default function App() {
                 </div>
               </div>
 
+            </div>
+          )}
+
+          {/* ----------------- TAB: REVIEW 2 OPERATIONS ----------------- */}
+          {activeTab === 'review2' && currentUser?.role === 'admin' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+              <div className="glass-card" style={{ padding: '24px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '12px' }}>
+                  <div>
+                    <span className="badge badge-cyan" style={{ marginBottom: '6px' }}>Review 2 — 70% Milestone</span>
+                    <h3 style={{ fontSize: '1.2rem', color: '#f8fafc' }}>Storage History & Capacity Operations</h3>
+                    <p style={{ fontSize: '0.82rem', color: '#94a3b8', maxWidth: '720px', marginTop: '4px' }}>
+                      Persist hourly capacity snapshots, fit a quadratic trend when enough daily history exists, and safely preview or execute tenant retention cleanup.
+                    </p>
+                  </div>
+                  <button className="btn btn-primary" onClick={handleCaptureSnapshot} disabled={loadingAction}>
+                    <History size={15} /> Capture Snapshot Now
+                  </button>
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '20px' }}>
+                <div className="glass-card" style={{ padding: '24px' }}>
+                  <h3 style={{ fontSize: '1.05rem', marginBottom: '8px' }}>Snapshot-based Quadratic Forecast</h3>
+                  {advancedForecast?.status === 'ok' ? (
+                    <>
+                      <p style={{ color: '#94a3b8', fontSize: '0.82rem' }}>
+                        Fitted from {advancedForecast.distinct_days} distinct days ({advancedForecast.fit_points} daily fit points).
+                      </p>
+                      <div style={{ marginTop: '14px', display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '0.85rem' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                          <span style={{ color: '#94a3b8' }}>Current measured storage</span>
+                          <span className="mono">{advancedForecast.current_storage_mb} MB</span>
+                        </div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                          <span style={{ color: '#94a3b8' }}>Projected exhaustion</span>
+                          <span className="mono" style={{ color: '#22d3ee' }}>
+                            {advancedForecast.exhaustion_date || 'Not within forecast horizon'}
+                          </span>
+                        </div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                          <span style={{ color: '#94a3b8' }}>Trend coefficients (a, b)</span>
+                          <span className="mono">{advancedForecast.coefficients.quadratic}, {advancedForecast.coefficients.linear}</span>
+                        </div>
+                      </div>
+                      <div style={{ maxHeight: '220px', overflow: 'auto', marginTop: '14px' }}>
+                        <table className="data-table">
+                          <thead><tr><th>Day</th><th>Projected storage</th></tr></thead>
+                          <tbody>
+                            {advancedForecast.trajectory.filter(point => point.day % 30 === 0).map(point => (
+                              <tr key={point.day}><td>{point.day}</td><td className="mono">{point.storage_mb} MB</td></tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  ) : (
+                    <div style={{ marginTop: '12px', padding: '14px', borderRadius: '8px', background: 'rgba(255,255,255,0.03)', color: '#cbd5e1', fontSize: '0.85rem' }}>
+                      {advancedForecast?.status === 'insufficient_history'
+                        ? `Forecast needs at least 3 distinct days of captured history; currently ${advancedForecast.distinct_days || 0}. Hourly snapshots are recorded automatically.`
+                        : advancedForecast?.status === 'degenerate_history'
+                          ? 'The stored history cannot support a stable quadratic fit yet. Capture more varied daily observations.'
+                          : 'Loading snapshot forecast…'}
+                    </div>
+                  )}
+                </div>
+
+                <div className="glass-card" style={{ padding: '24px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'flex-start' }}>
+                    <div>
+                      <h3 style={{ fontSize: '1.05rem' }}>Retention Cleanup</h3>
+                      <p style={{ color: '#94a3b8', fontSize: '0.82rem', marginTop: '4px' }}>First preview expired rows; execution is audited and irreversible.</p>
+                    </div>
+                    <button className="btn btn-secondary" onClick={refreshReview2Data} disabled={loadingAction}>Refresh preview</button>
+                  </div>
+                  {purgePreview ? (
+                    <>
+                      <div style={{ margin: '14px 0', display: 'flex', gap: '16px', flexWrap: 'wrap', fontSize: '0.85rem' }}>
+                        <span>Expired appointments: <strong className="mono">{purgePreview.expired_appointments}</strong></span>
+                        <span>Expired slots: <strong className="mono">{purgePreview.expired_slots}</strong></span>
+                      </div>
+                      <div style={{ maxHeight: '220px', overflow: 'auto' }}>
+                        <table className="data-table">
+                          <thead><tr><th>Tenant</th><th>Policy</th><th>Appointments</th><th>Slots</th></tr></thead>
+                          <tbody>{purgePreview.tenants.map(tenant => (
+                            <tr key={tenant.tenant_id}>
+                              <td>{tenant.tenant_name}</td><td>{tenant.retention_days} days</td>
+                              <td>{tenant.expired_appointments}</td><td>{tenant.expired_slots}</td>
+                            </tr>
+                          ))}</tbody>
+                        </table>
+                      </div>
+                      <button className="btn btn-primary" style={{ marginTop: '14px' }} onClick={handleRetentionPurge} disabled={loadingAction || purgePreview.expired_appointments + purgePreview.expired_slots === 0}>
+                        <Trash2 size={15} /> Execute Expired-Record Purge
+                      </button>
+                    </>
+                  ) : <p style={{ marginTop: '14px', color: '#94a3b8' }}>Loading retention preview…</p>}
+                </div>
+              </div>
+
+              <div className="glass-card" style={{ padding: '24px' }}>
+                <h3 style={{ fontSize: '1.05rem', marginBottom: '12px' }}>Recent Persistent Storage Snapshots</h3>
+                <div style={{ overflowX: 'auto' }}>
+                  <table className="data-table">
+                    <thead><tr><th>Captured</th><th>Storage</th><th>Quota</th><th>Usage</th><th>Physical DB</th></tr></thead>
+                    <tbody>
+                      {storageSnapshots.map(snapshot => (
+                        <tr key={snapshot.id}>
+                          <td className="mono">{new Date(snapshot.captured_at).toLocaleString()}</td>
+                          <td>{snapshot.storage_mb} MB</td><td>{snapshot.storage_limit_mb} MB</td>
+                          <td>{snapshot.usage_percent}%</td><td>{snapshot.tenant_id == null ? `${snapshot.physical_db_size_kb} KB` : 'Tenant-scoped'}</td>
+                        </tr>
+                      ))}
+                      {storageSnapshots.length === 0 && <tr><td colSpan="5">No snapshots captured yet. Capture one now to begin the history.</td></tr>}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
             </div>
           )}
 

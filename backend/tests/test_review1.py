@@ -1,4 +1,5 @@
 import os
+import datetime
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -6,8 +7,8 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.database import Base, get_db
 from backend.main import app
-from backend.models import Tenant, User, Doctor, Patient, Appointment, StorageConfig, AuditLog
-from backend.auth import hash_password, create_access_token
+from backend.models import Tenant, User, Doctor, Patient, Appointment, AppointmentSlot, StorageConfig, AuditLog, StorageSnapshot
+from backend.auth import hash_password
 
 # Test database
 TEST_DB = "test_hospital.db"
@@ -315,3 +316,105 @@ def test_10_experiment_scenarios_and_error_calculation():
         expected_proposed_err = abs(sc["proposed_predicted_days"] - sc["actual_days_to_exhaustion"])
         assert sc["baseline_error_days"] == expected_baseline_err
         assert sc["proposed_error_days"] == expected_proposed_err
+
+def test_11_storage_snapshots_and_tenant_scope():
+    admin_token = client.post(
+        "/api/auth/login", json={"email": "admin@hospital.com", "password": "admin123"}
+    ).json()["access_token"]
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+
+    captured = client.post("/api/metrics/snapshots", headers=admin_headers)
+    assert captured.status_code == 200
+    assert captured.json()["snapshots_created"] == 4
+
+    aggregate = client.get("/api/metrics/snapshots", headers=admin_headers)
+    assert aggregate.status_code == 200
+    assert len(aggregate.json()) == 1
+    assert aggregate.json()[0]["tenant_id"] is None
+
+    staff_token = client.post(
+        "/api/auth/login", json={"email": "staff@hospital.com", "password": "staff123"}
+    ).json()["access_token"]
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    own_history = client.get("/api/metrics/snapshots", headers=staff_headers)
+    assert own_history.status_code == 200
+    assert len(own_history.json()) == 1
+    assert own_history.json()[0]["tenant_id"] == 1
+    assert own_history.json()[0]["physical_db_size_kb"] == 0.0
+    assert client.get("/api/forecast/advanced", headers=staff_headers).status_code == 403
+
+    cross_tenant = client.get("/api/metrics/snapshots?tenant_id=2", headers=staff_headers)
+    assert cross_tenant.status_code == 403
+
+def test_12_snapshot_forecast_reports_insufficient_history_then_fits_curve():
+    db = TestingSessionLocal()
+    db.query(StorageSnapshot).delete()
+    db.add_all([
+        StorageSnapshot(tenant_id=None, captured_at=datetime.datetime.combine(
+            datetime.date.today() - datetime.timedelta(days=2), datetime.time.min,
+        ), storage_mb=1.0, storage_limit_mb=10.0, usage_percent=10.0),
+        StorageSnapshot(tenant_id=None, captured_at=datetime.datetime.combine(
+            datetime.date.today() - datetime.timedelta(days=1), datetime.time.min,
+        ), storage_mb=2.0, storage_limit_mb=10.0, usage_percent=20.0),
+        StorageSnapshot(tenant_id=None, captured_at=datetime.datetime.combine(
+            datetime.date.today(), datetime.time.min,
+        ), storage_mb=4.0, storage_limit_mb=10.0, usage_percent=40.0),
+    ])
+    db.commit()
+    db.close()
+
+    token = client.post(
+        "/api/auth/login", json={"email": "admin@hospital.com", "password": "admin123"}
+    ).json()["access_token"]
+    response = client.get("/api/forecast/advanced?horizon_days=30", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["distinct_days"] == 3
+    assert data["trajectory"][0]["storage_mb"] == 4.0
+    assert len(data["trajectory"]) == 31
+
+def test_13_retention_preview_and_purge_are_admin_controlled():
+    import datetime
+
+    db = TestingSessionLocal()
+    config = db.query(StorageConfig).filter(StorageConfig.tenant_id == 1).first()
+    config.retention_days = 30
+    old_date = (datetime.date.today() - datetime.timedelta(days=45)).isoformat()
+    recent_date = (datetime.date.today() - datetime.timedelta(days=5)).isoformat()
+    db.add_all([
+        Appointment(tenant_id=1, doctor_id=1, patient_id=1, date=old_date, slot_time="08:00 AM"),
+        Appointment(tenant_id=1, doctor_id=1, patient_id=2, date=recent_date, slot_time="08:30 AM"),
+        AppointmentSlot(tenant_id=1, doctor_id=1, date=old_date, slot_time="08:00 AM"),
+        AppointmentSlot(tenant_id=1, doctor_id=1, date=recent_date, slot_time="08:30 AM"),
+    ])
+    db.commit()
+    db.close()
+
+    staff_token = client.post(
+        "/api/auth/login", json={"email": "staff@hospital.com", "password": "staff123"}
+    ).json()["access_token"]
+    staff_headers = {"Authorization": f"Bearer {staff_token}"}
+    forbidden = client.post("/api/retention/purge?dry_run=false", headers=staff_headers)
+    assert forbidden.status_code == 403
+
+    admin_token = client.post(
+        "/api/auth/login", json={"email": "admin@hospital.com", "password": "admin123"}
+    ).json()["access_token"]
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    preview = client.post("/api/retention/purge?dry_run=true", headers=admin_headers)
+    assert preview.status_code == 200
+    assert preview.json()["expired_appointments"] == 1
+    assert preview.json()["deleted_appointments"] == 0
+
+    purge = client.post("/api/retention/purge?dry_run=false", headers=admin_headers)
+    assert purge.status_code == 200
+    assert purge.json()["deleted_appointments"] == 1
+    assert purge.json()["deleted_slots"] == 1
+
+    db = TestingSessionLocal()
+    assert db.query(Appointment).filter(Appointment.date == old_date).count() == 0
+    assert db.query(Appointment).filter(Appointment.date == recent_date).count() == 1
+    assert db.query(AppointmentSlot).filter(AppointmentSlot.date == old_date).count() == 0
+    assert db.query(AuditLog).filter(AuditLog.action == "RETENTION_PURGE").count() == 1
+    db.close()

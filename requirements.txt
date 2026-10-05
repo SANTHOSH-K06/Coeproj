@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+SQLAlchemy
+PyJWT
+psycopg[binary]
+PyMySQL
+pytest
+httpx

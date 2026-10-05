@@ -1,5 +1,7 @@
 import os
 import datetime
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, status, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,7 +10,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
 from .database import get_db, Base, engine
-from .models import Tenant, User, Doctor, Patient, AppointmentSlot, Appointment, StorageConfig, AuditLog
+from .models import Tenant, User, Doctor, Patient, AppointmentSlot, Appointment, StorageConfig, AuditLog, StorageSnapshot
 from .auth import (
     hash_password, verify_password, create_access_token, 
     get_current_user, require_admin, verify_tenant_access
@@ -20,15 +22,25 @@ from .forecasting import (
     run_baseline_forecast, run_proposed_forecast, generate_forecast_trajectories
 )
 from .experiments import run_all_scenarios
+from .storage_history import capture_storage_snapshot, polynomial_storage_forecast
+from .retention import purge_expired_records
+from .jobs import start_background_jobs, stop_background_jobs
 from scripts.generate_hospital_data import generate_data
 
-# Ensure tables are present
-Base.metadata.create_all(bind=engine)
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    Base.metadata.create_all(bind=engine)
+    jobs = start_background_jobs()
+    try:
+        yield
+    finally:
+        await stop_background_jobs(jobs)
 
 app = FastAPI(
     title="Hospital Capacity Forecasting API",
-    description="Multi-tenant hospital appointment management with capacity forecasting and storage analytics (Review 1 - 35% Milestone)",
-    version="0.35.0"
+    description="Multi-tenant hospital appointment management with persistent storage history, retention operations, and capacity forecasting (Review 2 - 70% Milestone)",
+    version="0.70.0",
+    lifespan=lifespan,
 )
 
 # Enable CORS for frontend development
@@ -316,6 +328,72 @@ def get_retention_metrics(
 ):
     return get_retention_comparison(db, projection_days=days)
 
+@app.post("/api/metrics/snapshots")
+def create_storage_snapshot(
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    rows = capture_storage_snapshot(db)
+    return {
+        "success": True,
+        "captured_at": rows[0].captured_at.isoformat(),
+        "snapshots_created": len(rows),
+        "storage_mb": rows[0].storage_mb,
+        "storage_limit_mb": rows[0].storage_limit_mb,
+    }
+
+@app.get("/api/metrics/snapshots")
+def list_storage_snapshots(
+    tenant_id: Optional[int] = None,
+    limit: int = Query(100, ge=1, le=1000),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    query = db.query(StorageSnapshot)
+    if tenant_id is not None:
+        verify_tenant_access(current_user, tenant_id, db)
+        query = query.filter(StorageSnapshot.tenant_id == tenant_id)
+    elif current_user.role == "admin":
+        query = query.filter(StorageSnapshot.tenant_id.is_(None))
+    else:
+        query = query.filter(StorageSnapshot.tenant_id == current_user.tenant_id)
+    snapshots = query.order_by(StorageSnapshot.captured_at.desc()).limit(limit).all()
+    return [
+        {
+            "id": snapshot.id,
+            "tenant_id": snapshot.tenant_id,
+            "captured_at": snapshot.captured_at.isoformat(),
+            "storage_mb": snapshot.storage_mb,
+            "storage_limit_mb": snapshot.storage_limit_mb,
+            "usage_percent": snapshot.usage_percent,
+            "physical_db_size_kb": snapshot.physical_db_size_kb,
+            "table_metrics": snapshot.table_metrics,
+        }
+        for snapshot in snapshots
+    ]
+
+@app.get("/api/forecast/advanced")
+def get_advanced_forecast(
+    horizon_days: int = Query(365, ge=30, le=1825),
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    configs = db.query(StorageConfig).all()
+    limit_mb = sum(config.max_storage_mb for config in configs) if configs else 75.0
+    return polynomial_storage_forecast(db, limit_mb, horizon_days=horizon_days)
+
+@app.post("/api/retention/purge")
+def run_retention_purge(
+    dry_run: bool = Query(True),
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    return purge_expired_records(
+        db,
+        dry_run=dry_run,
+        actor_email=admin_user.email,
+    )
+
 # ----------------- Config Endpoints (Admin Only) -----------------
 
 @app.put("/api/config/tenant/{tenant_id}")
@@ -449,5 +527,10 @@ def reset_demo_database(
     admin_user: User = Depends(require_admin)
 ):
     """Re-seed the synthetic dataset to baseline state."""
+    if engine.dialect.name != "sqlite":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Demo reset is disabled for non-SQLite databases because the synthetic seeder recreates tables.",
+        )
     generate_data()
     return {"success": True, "message": "Demo database successfully reset to baseline synthetic state."}

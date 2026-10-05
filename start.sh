@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# start.sh — Launch Hospital Capacity Forecasting System (Review 1)
+# start.sh — Launch Hospital Capacity Forecasting System (Review 2)
 
 echo "=========================================================="
-echo " Starting Hospital Capacity Forecasting System (Review 1)"
+echo " Starting Hospital Capacity Forecasting System (Review 2)"
 echo "=========================================================="
 
 # 1. Seed database if not present

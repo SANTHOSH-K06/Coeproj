@@ -1,7 +1,7 @@
 import datetime
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, ForeignKey, 
-    UniqueConstraint, Index, Boolean, Text
+    UniqueConstraint, Index, Boolean, Text, JSON
 )
 from sqlalchemy.orm import relationship
 from .database import Base
@@ -137,3 +137,17 @@ class AuditLog(Base):
     created_at = Column(DateTime, default=utc_now)
 
     tenant = relationship("Tenant", back_populates="audit_logs")
+
+class StorageSnapshot(Base):
+    __tablename__ = "storage_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True, index=True)
+    captured_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+    storage_mb = Column(Float, nullable=False)
+    storage_limit_mb = Column(Float, nullable=False)
+    usage_percent = Column(Float, nullable=False)
+    physical_db_size_kb = Column(Float, nullable=False, default=0.0)
+    table_metrics = Column(JSON, nullable=True)
+
+    tenant = relationship("Tenant")
